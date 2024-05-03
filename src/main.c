@@ -11,6 +11,7 @@
 #include <zephyr/drivers/gpio.h>
 
 #define SW0_NODE	DT_ALIAS(sw0)
+#define SW1_NODE	DT_ALIAS(sw1)
 
 static const uint16_t net_idx;
 static const uint16_t app_idx;
@@ -23,6 +24,10 @@ K_SEM_DEFINE(sem_node_added, 0, 1);
 #if DT_NODE_HAS_STATUS(SW0_NODE, okay)
 K_SEM_DEFINE(sem_button_pressed, 0, 1);
 #endif
+#if DT_NODE_HAS_STATUS(SW1_NODE, okay)
+K_SEM_DEFINE(sem_button_two_pressed, 0, 1);
+#endif
+
 
 static struct bt_mesh_cfg_cli cfg_cli = {
 };
@@ -192,11 +197,15 @@ static void configure_node(struct bt_mesh_cdb_node *node)
 		       elem.nsig, elem.nvnd);
 		for (int i = 0; i < elem.nsig; i++) {
 			uint16_t id = bt_mesh_comp_p0_elem_mod(&elem, i);
-
-			if (id == BT_MESH_MODEL_ID_CFG_CLI ||
-			    id == BT_MESH_MODEL_ID_CFG_SRV) {
-				continue;
-			}
+			// Bind the AppKey only to the generic OnOff Server and Client
+			//if ((id == BT_MESH_MODEL_ID_CFG_CLI ||
+			//    id == BT_MESH_MODEL_ID_CFG_SRV || 
+			//	(id != BT_MESH_MODEL_ID_GEN_ONOFF_SRV &&
+			//	id != BT_MESH_MODEL_ID_GEN_ONOFF_CLI) ||
+			//	(id != BT_MESH_MODEL_ID_BLOB_CLI &&
+			//	id != BT_MESH_MODEL_ID_BLOB_SRV))) {
+			//	continue;
+			//}
 			printk("Binding AppKey to model 0x%03x:%04x\n",
 			       elem_addr, id);
 
@@ -206,6 +215,8 @@ static void configure_node(struct bt_mesh_cdb_node *node)
 				printk("Failed (err: %d, status: %d)\n", err,
 				       status);
 			}
+
+
 		}
 
 		for (int i = 0; i < elem.nvnd; i++) {
@@ -233,6 +244,122 @@ static void configure_node(struct bt_mesh_cdb_node *node)
 	}
 
 	printk("Configuration complete\n");
+}
+
+
+// Start from 0x0002 to exclude the initial provisioner
+void set_publications(uint16_t starting_address){
+	NET_BUF_SIMPLE_DEFINE(buf, BT_MESH_RX_SDU_MAX);
+	struct bt_mesh_comp_p0_elem elem;
+	struct bt_mesh_cdb_app_key *key;
+	uint8_t app_key[16];
+	struct bt_mesh_comp_p0 comp;
+	uint8_t status;
+	int err, elem_addr;
+	struct bt_mesh_cfg_cli_mod_pub pub_cfg;
+
+	uint16_t switches[16] = {0};
+	uint16_t switch_counter = 0;
+	uint16_t lights[16] = {0};
+	uint16_t light_counter = 0;
+
+	key = bt_mesh_cdb_app_key_get(app_idx);
+	if (key == NULL) {
+		printk("No app-key 0x%04x\n", app_idx);
+		return;
+	}
+
+	err = bt_mesh_cdb_app_key_export(key, 0, app_key);
+	if (err) {
+		printk("Failed to export appkey from cdb. Err:%d\n", err);
+		return;
+	}
+
+	struct bt_mesh_cdb_node *found_node;
+
+	uint16_t current_node = 0;
+
+	while((found_node = bt_mesh_cdb_node_get(starting_address++))){
+		if(found_node->addr == current_node){
+			continue;
+		}
+		current_node = found_node->addr;
+		printk("Found node with id 0x%03x\n", found_node->addr);
+
+		// Get the composition of the publisher(sender)
+		err = bt_mesh_cfg_cli_comp_data_get(net_idx, found_node->addr, 0, &status, &buf);
+		if (err || status) {
+			printk("Failed to get Composition data (err %d, status: %d)\n",
+		    	   err, status);
+			//return;
+		}
+	
+		err = bt_mesh_comp_p0_get(&comp, &buf);
+		if (err) {
+			printk("Unable to parse composition data (err: %d)\n", err);
+			return;
+		}
+
+		elem_addr = found_node->addr;
+		while (bt_mesh_comp_p0_elem_pull(&comp, &elem)) {
+			printk("Element @ 0x%04x: %u + %u models\n", elem_addr,
+			       elem.nsig, elem.nvnd);
+			for (int i = 0; i < elem.nsig; i++) {
+				uint16_t id = bt_mesh_comp_p0_elem_mod(&elem, i);
+
+				if ((id == BT_MESH_MODEL_ID_GEN_ONOFF_CLI)) {
+					printk("Found OnOff client for 0x%03x:0x%04x\n",
+					found_node->addr, elem_addr);
+					switches[switch_counter++] = elem_addr;
+				} else if ((id == BT_MESH_MODEL_ID_GEN_ONOFF_SRV)) {
+					printk("Found OnOff server for 0x%03x:0x%04x\n",
+					found_node->addr, elem_addr);
+					lights[light_counter++] = elem_addr;
+				}
+			}
+			elem_addr++;
+		}
+
+	}
+
+	for(int i = 0; i < light_counter; i++ ){
+		printk("Lights 0x%04x\n", lights[i]);
+		printk("Switches 0x%04x\n", switches[i]);
+	}
+
+	if(switch_counter == 0 || light_counter == 0){
+		goto skip_pub_set;
+	}
+
+	pub_cfg.addr = 0;
+	pub_cfg.uuid = NULL;
+	pub_cfg.app_idx = app_idx;
+	pub_cfg.cred_flag = false;
+	pub_cfg.ttl = 35;
+	pub_cfg.period = 0;
+	pub_cfg.transmit = BT_MESH_TRANSMIT(0, 50);
+
+	int publication_counter = 0;
+
+	while (publication_counter < switch_counter) {
+
+			pub_cfg.addr = lights[publication_counter];
+			printk("Setting publication 0x%03x:%04x -> %04x\n", switches[0], switches[publication_counter], pub_cfg.addr);
+			err = bt_mesh_cfg_cli_mod_pub_set(net_idx, switches[0], switches[publication_counter], BT_MESH_MODEL_ID_GEN_ONOFF_CLI, &pub_cfg, &status);
+			if (err || status) {
+			printk("Failed to set publication (err %d, status: %d)\n",
+		    	   err, status);
+				//return;
+			}
+			publication_counter++;
+
+	}
+
+
+	printk("Publication configuration set\n");
+skip_pub_set:
+	return;
+
 }
 
 static void unprovisioned_beacon(uint8_t uuid[16],
@@ -275,6 +402,8 @@ static int bt_ready(void)
 
 	bt_rand(net_key, 16);
 
+	// This part can be skipped on the outer provisioners
+	
 	err = bt_mesh_cdb_create(net_key);
 	if (err == -EALREADY) {
 		printk("Using stored CDB\n");
@@ -316,36 +445,67 @@ static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 }
 
 #if DT_NODE_HAS_STATUS(SW0_NODE, okay)
-static const struct gpio_dt_spec button = GPIO_DT_SPEC_GET_OR(SW0_NODE, gpios, {0});
-static struct gpio_callback button_cb_data;
+static const struct gpio_dt_spec button_one = GPIO_DT_SPEC_GET_OR(SW0_NODE, gpios, {0});
+static const struct gpio_dt_spec button_two = GPIO_DT_SPEC_GET_OR(SW1_NODE, gpios, {0});
+static struct gpio_callback button_one_cb_data;
+static struct gpio_callback button_two_cb_data;
 
-static void button_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+static void button_one_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	k_sem_give(&sem_button_pressed);
+}
+
+static void button_two_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	k_sem_give(&sem_button_two_pressed);
 }
 
 static void button_init(void)
 {
 	int ret;
 
-	if (!gpio_is_ready_dt(&button)) {
-		printk("Error: button device %s is not ready\n", button.port->name);
+	if (!gpio_is_ready_dt(&button_one)) {
+		printk("Error: button device %s is not ready\n", button_one.port->name);
 		return;
 	}
-	ret = gpio_pin_configure_dt(&button, GPIO_INPUT);
+
+	if (!gpio_is_ready_dt(&button_two)) {
+		printk("Error: button device %s is not ready\n", button_two.port->name);
+		return;
+	}
+
+	ret = gpio_pin_configure_dt(&button_one, GPIO_INPUT);
 	if (ret != 0) {
-		printk("Error %d: failed to configure %s pin %d\n", ret, button.port->name,
-		       button.pin);
+		printk("Error %d: failed to configure %s pin %d\n", ret, button_one.port->name,
+		       button_one.pin);
 		return;
 	}
-	ret = gpio_pin_interrupt_configure_dt(&button, GPIO_INT_EDGE_TO_ACTIVE);
+
+	ret = gpio_pin_configure_dt(&button_two, GPIO_INPUT);
+	if (ret != 0) {
+		printk("Error %d: failed to configure %s pin %d\n", ret, button_two.port->name,
+		       button_two.pin);
+		return;
+	}
+
+	ret = gpio_pin_interrupt_configure_dt(&button_one, GPIO_INT_EDGE_TO_ACTIVE);
 	if (ret != 0) {
 		printk("Error %d: failed to configure interrupt on %s pin %d\n", ret,
-		       button.port->name, button.pin);
+		       button_one.port->name, button_one.pin);
 		return;
 	}
-	gpio_init_callback(&button_cb_data, button_pressed, BIT(button.pin));
-	gpio_add_callback(button.port, &button_cb_data);
+
+	ret = gpio_pin_interrupt_configure_dt(&button_two, GPIO_INT_EDGE_TO_ACTIVE);
+	if (ret != 0) {
+		printk("Error %d: failed to configure interrupt on %s pin %d\n", ret,
+		       button_two.port->name, button_two.pin);
+		return;
+	}
+
+	gpio_init_callback(&button_one_cb_data, button_one_pressed, BIT(button_one.pin));
+	gpio_init_callback(&button_two_cb_data, button_two_pressed, BIT(button_two.pin));
+	gpio_add_callback(button_one.port, &button_one_cb_data);
+	gpio_add_callback(button_two.port, &button_two_cb_data);
 }
 #endif
 
@@ -374,6 +534,23 @@ int main(void)
 		k_sem_reset(&sem_unprov_beacon);
 		k_sem_reset(&sem_node_added);
 		bt_mesh_cdb_node_foreach(check_unconfigured, NULL);
+
+#if DT_NODE_HAS_STATUS(SW1_NODE, okay)
+		k_sem_reset(&sem_button_two_pressed);
+		printk("Press button 2 to configure publications\n");
+		err = k_sem_take(&sem_button_two_pressed, K_SECONDS(5));
+		if (err == -EAGAIN) {
+			printk("Timed out, button 2 wasn't pressed in time.\n");
+			goto skip_publication_config;
+		}
+#endif
+		struct bt_mesh_cdb_node* to_node =  bt_mesh_cdb_node_get(0x0002);
+		struct bt_mesh_cdb_node* from_node = bt_mesh_cdb_node_get(0x0006);
+
+		set_publications(0x0002);
+		
+skip_publication_config:
+
 
 		printk("Waiting for unprovisioned beacon...\n");
 		err = k_sem_take(&sem_unprov_beacon, K_SECONDS(10));
