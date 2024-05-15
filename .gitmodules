@@ -1,0 +1,3 @@
+[submodule "src/lib/model"]
+	path = src/lib/model
+	url = git@github.com:KristapsKalnins/bt_mesh_provisioner_helper_model.git

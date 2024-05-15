@@ -9,15 +9,18 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/mesh.h>
 #include <zephyr/drivers/gpio.h>
+#include "prov_helper_cli.h"
+#include "prov_helper_srv.h"
 
 #define SW0_NODE	DT_ALIAS(sw0)
 #define SW1_NODE	DT_ALIAS(sw1)
 
-static const uint16_t net_idx;
-static const uint16_t app_idx;
+static const uint16_t net_idx = 0;
+static const uint16_t app_idx = 0;
 static uint16_t self_addr = 1, node_addr;
 static const uint8_t dev_uuid[16] = { 0xdd, 0xdd };
 static uint8_t node_uuid[16];
+static uint8_t net_key[16];
 
 K_SEM_DEFINE(sem_unprov_beacon, 0, 1);
 K_SEM_DEFINE(sem_node_added, 0, 1);
@@ -26,6 +29,9 @@ K_SEM_DEFINE(sem_button_pressed, 0, 1);
 #endif
 #if DT_NODE_HAS_STATUS(SW1_NODE, okay)
 K_SEM_DEFINE(sem_button_two_pressed, 0, 1);
+#endif
+#if DT_NODE_HAS_STATUS(SW2_NODE, okay)
+K_SEM_DEFINE(sem_button_three_pressed, 0, 1);
 #endif
 
 
@@ -58,6 +64,34 @@ static struct bt_mesh_health_cli health_cli = {
 	.current_status = health_current_status,
 };
 
+
+void save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh_msg_ctx *ctx,
+		struct net_buf_simple *buf){
+	
+		
+	char* uuid_p = net_buf_simple_pull_mem(buf, 16);
+    uint16_t addr = net_buf_simple_pull_le16(buf);
+    uint16_t net_idx = net_buf_simple_pull_le16(buf);
+    uint8_t num_elem = net_buf_simple_pull_u8(buf);
+    char* dev_key_p = net_buf_simple_pull_mem(buf, 16);
+	
+	struct bt_mesh_cdb_node* new_node =  bt_mesh_cdb_node_alloc(uuid_p, addr, num_elem, net_idx);
+
+	bt_mesh_cdb_node_key_import(new_node, dev_key_p);
+	
+	return;
+}
+
+const struct bt_mesh_time_srv_handlers srv_helper_handlers = {
+	.prov_helper_message_appkey = NULL,
+	.prov_helper_message_netkey = NULL,
+	.prov_helper_message_nodeinfo = save_remote_node_in_cdb,
+};
+
+
+struct bt_mesh_prov_helper_cli helper_cli = BT_MESH_PROV_HELPER_CLI_INIT();
+struct bt_mesh_prov_helper_srv helper_srv = BT_MESH_PROV_HELPER_SRV_INIT(&srv_helper_handlers);
+
 static struct bt_mesh_model root_models[] = {
 	BT_MESH_MODEL_CFG_SRV,
 	BT_MESH_MODEL_CFG_CLI(&cfg_cli),
@@ -65,7 +99,8 @@ static struct bt_mesh_model root_models[] = {
 };
 
 static struct bt_mesh_elem elements[] = {
-	BT_MESH_ELEM(0, root_models, BT_MESH_MODEL_NONE),
+	BT_MESH_ELEM(0, root_models,  BT_MESH_MODEL_LIST(BT_MESH_MODEL_PROV_HELPER_CLI(&helper_cli),
+													 BT_MESH_MODEL_PROV_HELPER_SRV(&helper_srv))),
 };
 
 static const struct bt_mesh_comp mesh_comp = {
@@ -136,6 +171,23 @@ static void configure_self(struct bt_mesh_cdb_node *self)
 		       status);
 		return;
 	}
+
+	err = bt_mesh_cfg_cli_mod_app_bind_vnd(self->net_idx, self->addr, self->addr, app_idx,
+					   BT_MESH_VND_MODEL_ID_PROV_HELPER_CLI, COMPANY_ID, &status);
+	if (err || status) {
+		printk("Failed to bind app-key for prov helper cli(err %d, status %d)\n", err,
+		       status);
+		//return;
+	}
+
+	err = bt_mesh_cfg_cli_mod_app_bind_vnd(self->net_idx, self->addr, self->addr, app_idx,
+					   BT_MESH_VND_MODEL_ID_PROV_HELPER_SRV, COMPANY_ID, &status);
+	if (err || status) {
+		printk("Failed to bind app-key for prov helper srv(err %d, status %d)\n", err,
+		       status);
+		return;
+	}
+
 
 	atomic_set_bit(self->flags, BT_MESH_CDB_NODE_CONFIGURED);
 
@@ -246,23 +298,112 @@ static void configure_node(struct bt_mesh_cdb_node *node)
 	printk("Configuration complete\n");
 }
 
+int get_list_of_node_addresses(uint16_t nodes[]){
+	
+	int node_counter = 0;
+
+	struct bt_mesh_cdb_node *found_node;
+	uint16_t current_node = 0;
+
+	uint16_t starting_address = self_addr + 1;
+
+	while((found_node = bt_mesh_cdb_node_get(starting_address++))){
+		if(found_node->addr == current_node){
+			continue;
+		}
+		current_node = found_node->addr;
+		nodes[node_counter++] = current_node;
+	}
+	return node_counter;
+}
+
+
+void set_provisioner_publications(){
+	NET_BUF_SIMPLE_DEFINE(buf, BT_MESH_RX_SDU_MAX);
+	struct bt_mesh_comp_p0_elem elem;
+	struct bt_mesh_comp_p0 comp;
+	uint8_t status;
+	int err, elem_addr;
+	struct bt_mesh_cfg_cli_mod_pub pub_prov;
+
+	struct bt_mesh_cdb_node *self_node;
+
+	self_node = bt_mesh_cdb_node_get(self_addr);
+
+	// Get the composition of the publisher(sender)
+	err = bt_mesh_cfg_cli_comp_data_get(net_idx, self_node->addr, 0, &status, &buf);
+	if (err || status) {
+		printk("Failed to get Composition data (err %d, status: %d)\n",
+		    	err, status);
+		//return;
+	}
+	
+	err = bt_mesh_comp_p0_get(&comp, &buf);
+	if (err) {
+		printk("Unable to parse composition data (err: %d)\n", err);
+		return;
+	}
+
+	uint16_t list_of_nodes[10];
+
+	int num_nodes = get_list_of_node_addresses(list_of_nodes);
+
+	elem_addr = self_node->addr;
+	while (bt_mesh_comp_p0_elem_pull(&comp, &elem)) {
+		printk("Element @ 0x%04x: %u + %u models\n", elem_addr,
+		       elem.nsig, elem.nvnd);
+	
+		for (int i = 0; i < elem.nvnd; i++){
+			struct bt_mesh_mod_id_vnd vnd_id = bt_mesh_comp_p0_elem_mod_vnd(&elem, i);
+			if(vnd_id.id == BT_MESH_VND_MODEL_ID_PROV_HELPER_CLI){
+				printk("Found Provisioner Helper Client for 0x%03x:0x%04x\n",
+						self_node->addr, elem_addr);
+				for(int i = 0; i < num_nodes; i++){		
+					// Set a publication on the provisioned device to publish
+					// back to the provisioner
+					// For outer provisioners, this address would be the original provisioners addres
+					pub_prov.addr = list_of_nodes[i];
+					pub_prov.uuid = NULL;
+					pub_prov.app_idx = app_idx;
+					pub_prov.cred_flag = false;
+					pub_prov.ttl = 35;
+					pub_prov.period = 0;
+					pub_prov.transmit = BT_MESH_TRANSMIT(0, 50);
+					int err = bt_mesh_cfg_cli_mod_pub_set_vnd(net_idx, self_addr, elem_addr, BT_MESH_VND_MODEL_ID_PROV_HELPER_CLI, COMPANY_ID, &pub_prov, &status);
+					if (err || status) {
+						printk("Failed to set publication (err %d, status: %d)\n",
+		    	   			err, status);
+					}else{
+						printk("Publication set! 0x%04x:0x%04x -> 0x%04x\n", self_addr, elem_addr, list_of_nodes[i]);
+					}
+				}
+			}
+			if(vnd_id.id == BT_MESH_VND_MODEL_ID_PROV_HELPER_SRV){
+				printk("Found Provisioner Helper Server for 0x%03x:0x%04x\n",
+						self_node->addr, elem_addr);
+			
+			}
+		}
+		elem_addr++;
+	}
+}
 
 // Start from 0x0002 to exclude the initial provisioner
 void set_publications(uint16_t starting_address){
 	NET_BUF_SIMPLE_DEFINE(buf, BT_MESH_RX_SDU_MAX);
 	struct bt_mesh_comp_p0_elem elem;
-	struct bt_mesh_cdb_app_key *key;
-	uint8_t app_key[16];
+	//struct bt_mesh_cdb_app_key *key;
+	//uint8_t app_key[16];
 	struct bt_mesh_comp_p0 comp;
 	uint8_t status;
 	int err, elem_addr;
-	struct bt_mesh_cfg_cli_mod_pub pub_cfg;
+	struct bt_mesh_cfg_cli_mod_pub pub_cfg, pub_prov;
 
 	uint16_t switches[16] = {0};
 	uint16_t switch_counter = 0;
 	uint16_t lights[16] = {0};
 	uint16_t light_counter = 0;
-
+/*
 	key = bt_mesh_cdb_app_key_get(app_idx);
 	if (key == NULL) {
 		printk("No app-key 0x%04x\n", app_idx);
@@ -274,7 +415,7 @@ void set_publications(uint16_t starting_address){
 		printk("Failed to export appkey from cdb. Err:%d\n", err);
 		return;
 	}
-
+*/
 	struct bt_mesh_cdb_node *found_node;
 
 	uint16_t current_node = 0;
@@ -306,7 +447,7 @@ void set_publications(uint16_t starting_address){
 			       elem.nsig, elem.nvnd);
 			for (int i = 0; i < elem.nsig; i++) {
 				uint16_t id = bt_mesh_comp_p0_elem_mod(&elem, i);
-
+				
 				if ((id == BT_MESH_MODEL_ID_GEN_ONOFF_CLI)) {
 					printk("Found OnOff client for 0x%03x:0x%04x\n",
 					found_node->addr, elem_addr);
@@ -317,6 +458,42 @@ void set_publications(uint16_t starting_address){
 					lights[light_counter++] = elem_addr;
 				}
 			}
+
+			/* for (int i = 0; i < elem.nvnd; i++){
+				struct bt_mesh_mod_id_vnd vnd_id = bt_mesh_comp_p0_elem_mod_vnd(&elem, i);
+				if(vnd_id.id == BT_MESH_VND_MODEL_ID_PROV_HELPER_CLI){
+					printk("Found Provisioner Helper Client for 0x%03x:0x%04x\n",
+							found_node->addr, elem_addr);
+
+					// Set a publication on the provisioned device to publish
+					// back to the provisioner
+					// For outer provisioners, this address would be the original provisioners addres
+
+					pub_prov.addr = self_addr;
+					pub_prov.uuid = NULL;
+					pub_prov.app_idx = app_idx;
+					pub_prov.cred_flag = false;
+					pub_prov.ttl = 35;
+					pub_prov.period = 0;
+					pub_prov.transmit = BT_MESH_TRANSMIT(0, 50);
+
+
+					int err = bt_mesh_cfg_cli_mod_pub_set_vnd(net_idx, found_node->addr, elem_addr, BT_MESH_VND_MODEL_ID_PROV_HELPER_CLI, COMPANY_ID, &pub_prov, &status);
+					if (err || status) {
+						printk("Failed to set publication (err %d, status: %d)\n",
+		    	   			err, status);
+					}else{
+						printk("Publication set! 0x%04x:0x%04x -> 0x%04x\n", found_node->addr, elem_addr, self_addr);
+					}
+				}
+				if(vnd_id.id == BT_MESH_VND_MODEL_ID_PROV_HELPER_SRV){
+					printk("Found Provisioner Helper Server for 0x%03x:0x%04x\n",
+							found_node->addr, elem_addr);
+				
+				}
+
+			} */
+
 			elem_addr++;
 		}
 
@@ -384,7 +561,7 @@ static const struct bt_mesh_prov prov = {
 
 static int bt_ready(void)
 {
-	uint8_t net_key[16], dev_key[16];
+	uint8_t dev_key[16];
 	int err;
 
 	err = bt_mesh_init(&prov, &mesh_comp);
@@ -458,6 +635,11 @@ static void button_one_pressed(const struct device *dev, struct gpio_callback *c
 static void button_two_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
 	k_sem_give(&sem_button_two_pressed);
+}
+
+static void button_three_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
+{
+	k_sem_give(&sem_button_three_pressed);
 }
 
 static void button_init(void)
@@ -544,14 +726,25 @@ int main(void)
 			goto skip_publication_config;
 		}
 #endif
-		struct bt_mesh_cdb_node* to_node =  bt_mesh_cdb_node_get(0x0002);
-		struct bt_mesh_cdb_node* from_node = bt_mesh_cdb_node_get(0x0006);
 
 		set_publications(0x0002);
-		
+		set_provisioner_publications();
+
+
 skip_publication_config:
 
 
+#if DT_NODE_HAS_STATUS(SW2_NODE, okay)
+		k_sem_reset(&sem_button_three_pressed);
+		printk("Press button 3 to forward prov data\n");
+		err = k_sem_take(&sem_button_three_pressed, K_SECONDS(5));
+		if (err == -EAGAIN) {
+			printk("Timed out, button 3 wasn't pressed in time.\n");
+			goto skip_prov_data_forward;
+		}
+#endif
+
+skip_prov_data_forward:
 		printk("Waiting for unprovisioned beacon...\n");
 		err = k_sem_take(&sem_unprov_beacon, K_SECONDS(10));
 		if (err == -EAGAIN) {
