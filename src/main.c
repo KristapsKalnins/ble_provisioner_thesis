@@ -14,6 +14,7 @@
 
 #define SW0_NODE	DT_ALIAS(sw0)
 #define SW1_NODE	DT_ALIAS(sw1)
+#define SW2_NODE	DT_ALIAS(sw2)
 
 static const uint16_t net_idx = 0;
 static const uint16_t app_idx = 0;
@@ -21,6 +22,11 @@ static uint16_t self_addr = 1, node_addr;
 static const uint8_t dev_uuid[16] = { 0xdd, 0xdd };
 static uint8_t node_uuid[16];
 static uint8_t net_key[16];
+static uint8_t app_key[16];
+static uint16_t current_node_address;
+static uint16_t provisioning_address_range_start = 0x0002;
+static uint16_t provisioning_address_range_end = 0x400;
+
 
 K_SEM_DEFINE(sem_unprov_beacon, 0, 1);
 K_SEM_DEFINE(sem_node_added, 0, 1);
@@ -112,7 +118,6 @@ static const struct bt_mesh_comp mesh_comp = {
 static void setup_cdb(void)
 {
 	struct bt_mesh_cdb_app_key *key;
-	uint8_t app_key[16];
 	int err;
 
 	key = bt_mesh_cdb_app_key_alloc(net_idx, app_idx);
@@ -388,6 +393,59 @@ void set_provisioner_publications(){
 	}
 }
 
+int send_provisioning_data_to_outer_nodes(){
+	//NET_BUF_SIMPLE_DEFINE(buf, BT_MESH_RX_SDU_MAX);
+	//struct bt_mesh_comp_p0_elem elem;
+	//struct bt_mesh_cdb_app_key *key;
+	//uint8_t app_key[16];
+
+	uint16_t nodes[32];
+	//struct bt_mesh_comp_p0 comp;
+	//uint8_t status;
+	//int err, elem_addr;
+
+	//struct bt_mesh_cdb_node *found_node;
+
+	//uint16_t current_node = 0;
+
+	int num_of_nodes = get_list_of_node_addresses(nodes);
+
+	uint16_t remaining_address_count = provisioning_address_range_end - current_node_address;	
+
+	if (!remaining_address_count){
+		return 0;
+	}
+	
+	if(!num_of_nodes){
+		return 0;
+	}
+
+	uint16_t addresses_per_next_provisioner = remaining_address_count / num_of_nodes;
+	
+	if(addresses_per_next_provisioner == 0){
+		addresses_per_next_provisioner = 1;
+	} 
+
+	for(int i = 0; i < num_of_nodes; i++){
+		
+		uint16_t start_addr = current_node_address + (addresses_per_next_provisioner * i);
+		uint16_t end_addr = start_addr + addresses_per_next_provisioner;
+
+		remaining_address_count -= addresses_per_next_provisioner;
+
+		printk("Sending 0x%04X -> 0x%04X with 0x%04X origin to 0x%04X\n", start_addr, end_addr,
+																		  self_addr,
+																		  nodes[i]);
+		
+		bt_mesh_prov_helper_cli_send_addrinfo(&elements[0].vnd_models[0], start_addr,end_addr, self_addr, nodes[i]);
+	
+		if(remaining_address_count <= 0){
+			break;
+		}
+	}
+	return 0; 	
+}
+
 // Start from 0x0002 to exclude the initial provisioner
 void set_publications(uint16_t starting_address){
 	NET_BUF_SIMPLE_DEFINE(buf, BT_MESH_RX_SDU_MAX);
@@ -399,9 +457,9 @@ void set_publications(uint16_t starting_address){
 	int err, elem_addr;
 	struct bt_mesh_cfg_cli_mod_pub pub_cfg, pub_prov;
 
-	uint16_t switches[16] = {0};
+	uint32_t switches[16] = {0};
 	uint16_t switch_counter = 0;
-	uint16_t lights[16] = {0};
+	uint32_t lights[16] = {0};
 	uint16_t light_counter = 0;
 /*
 	key = bt_mesh_cdb_app_key_get(app_idx);
@@ -419,9 +477,10 @@ void set_publications(uint16_t starting_address){
 	struct bt_mesh_cdb_node *found_node;
 
 	uint16_t current_node = 0;
-
-	while((found_node = bt_mesh_cdb_node_get(starting_address++))){
-		if(found_node->addr == current_node){
+	while(starting_address < provisioning_address_range_end){
+		found_node = bt_mesh_cdb_node_get(starting_address);
+		starting_address += 1;
+		if(found_node->addr == current_node || found_node == NULL || found_node->addr + 1 != starting_address){
 			continue;
 		}
 		current_node = found_node->addr;
@@ -451,11 +510,13 @@ void set_publications(uint16_t starting_address){
 				if ((id == BT_MESH_MODEL_ID_GEN_ONOFF_CLI)) {
 					printk("Found OnOff client for 0x%03x:0x%04x\n",
 					found_node->addr, elem_addr);
-					switches[switch_counter++] = elem_addr;
+					switches[switch_counter] = (uint32_t)(found_node->addr) << 16;
+					switches[switch_counter++] |= elem_addr;
 				} else if ((id == BT_MESH_MODEL_ID_GEN_ONOFF_SRV)) {
 					printk("Found OnOff server for 0x%03x:0x%04x\n",
 					found_node->addr, elem_addr);
-					lights[light_counter++] = elem_addr;
+					lights[light_counter] = (uint32_t)(found_node->addr) << 16;
+					lights[light_counter++] |= elem_addr;
 				}
 			}
 
@@ -500,11 +561,12 @@ void set_publications(uint16_t starting_address){
 	}
 
 	for(int i = 0; i < light_counter; i++ ){
-		printk("Lights 0x%04x\n", lights[i]);
-		printk("Switches 0x%04x\n", switches[i]);
+		printk("Lights 0x%08x\n", lights[i]);
+		printk("Switches 0x%08x\n", switches[i]);
 	}
 
 	if(switch_counter == 0 || light_counter == 0){
+		printk("Skipping %d %d", switch_counter, light_counter);
 		goto skip_pub_set;
 	}
 
@@ -520,9 +582,9 @@ void set_publications(uint16_t starting_address){
 
 	while (publication_counter < switch_counter) {
 
-			pub_cfg.addr = lights[publication_counter];
-			printk("Setting publication 0x%03x:%04x -> %04x\n", switches[0], switches[publication_counter], pub_cfg.addr);
-			err = bt_mesh_cfg_cli_mod_pub_set(net_idx, switches[0], switches[publication_counter], BT_MESH_MODEL_ID_GEN_ONOFF_CLI, &pub_cfg, &status);
+			pub_cfg.addr = (uint16_t)(lights[publication_counter] & 0xFFFF);
+			printk("Setting publication 0x%03x:%04x -> %04x\n", (uint16_t)((switches[publication_counter] & 0xFFFF0000) >> 16), (uint16_t)(switches[publication_counter] & 0x0000FFFF) , pub_cfg.addr);
+			err = bt_mesh_cfg_cli_mod_pub_set(net_idx, (uint16_t)((switches[publication_counter] & 0xFFFF0000) >> 16), (uint16_t)(switches[publication_counter] & 0x0000FFFF), BT_MESH_MODEL_ID_GEN_ONOFF_CLI, &pub_cfg, &status);
 			if (err || status) {
 			printk("Failed to set publication (err %d, status: %d)\n",
 		    	   err, status);
@@ -615,6 +677,16 @@ static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 			configure_self(node);
 		} else {
 			configure_node(node);
+
+			while(bt_mesh_prov_helper_cli_send_appkey(&elements[0].vnd_models[0], app_key, node->addr) == -EBUSY){k_sleep(K_MSEC(100));};
+		
+			while(bt_mesh_prov_helper_cli_send_netkey(&elements[0].vnd_models[0], net_key, node->addr) == -EBUSY){k_sleep(K_MSEC(100));};
+
+			struct bt_mesh_cdb_node* newnode = bt_mesh_cdb_node_get(node_addr);
+
+			printk("New node has %d elements\n", newnode->num_elem);
+
+			current_node_address += newnode->num_elem;
 		}
 	}
 
@@ -624,8 +696,10 @@ static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 #if DT_NODE_HAS_STATUS(SW0_NODE, okay)
 static const struct gpio_dt_spec button_one = GPIO_DT_SPEC_GET_OR(SW0_NODE, gpios, {0});
 static const struct gpio_dt_spec button_two = GPIO_DT_SPEC_GET_OR(SW1_NODE, gpios, {0});
+static const struct gpio_dt_spec button_three = GPIO_DT_SPEC_GET_OR(SW2_NODE, gpios, {0});
 static struct gpio_callback button_one_cb_data;
 static struct gpio_callback button_two_cb_data;
+static struct gpio_callback button_three_cb_data;
 
 static void button_one_pressed(const struct device *dev, struct gpio_callback *cb, uint32_t pins)
 {
@@ -656,6 +730,11 @@ static void button_init(void)
 		return;
 	}
 
+	if (!gpio_is_ready_dt(&button_three)) {
+		printk("Error: button device %s is not ready\n", button_three.port->name);
+		return;
+	}
+
 	ret = gpio_pin_configure_dt(&button_one, GPIO_INPUT);
 	if (ret != 0) {
 		printk("Error %d: failed to configure %s pin %d\n", ret, button_one.port->name,
@@ -667,6 +746,13 @@ static void button_init(void)
 	if (ret != 0) {
 		printk("Error %d: failed to configure %s pin %d\n", ret, button_two.port->name,
 		       button_two.pin);
+		return;
+	}
+
+	ret = gpio_pin_configure_dt(&button_three, GPIO_INPUT);
+	if (ret != 0) {
+		printk("Error %d: failed to configure %s pin %d\n", ret, button_three.port->name,
+		       button_three.pin);
 		return;
 	}
 
@@ -684,10 +770,19 @@ static void button_init(void)
 		return;
 	}
 
+	ret = gpio_pin_interrupt_configure_dt(&button_three, GPIO_INT_EDGE_TO_ACTIVE);
+	if (ret != 0) {
+		printk("Error %d: failed to configure interrupt on %s pin %d\n", ret,
+		       button_three.port->name, button_three.pin);
+		return;
+	}
+
 	gpio_init_callback(&button_one_cb_data, button_one_pressed, BIT(button_one.pin));
 	gpio_init_callback(&button_two_cb_data, button_two_pressed, BIT(button_two.pin));
+	gpio_init_callback(&button_three_cb_data, button_three_pressed, BIT(button_three.pin));
 	gpio_add_callback(button_one.port, &button_one_cb_data);
 	gpio_add_callback(button_two.port, &button_two_cb_data);
+	gpio_add_callback(button_three.port, &button_three_cb_data);
 }
 #endif
 
@@ -695,6 +790,8 @@ int main(void)
 {
 	char uuid_hex_str[32 + 1];
 	int err;
+
+	current_node_address = provisioning_address_range_start;
 
 	printk("Initializing...\n");
 
@@ -744,9 +841,15 @@ skip_publication_config:
 		}
 #endif
 
+
+		send_provisioning_data_to_outer_nodes();
+
+
+
+
 skip_prov_data_forward:
 		printk("Waiting for unprovisioned beacon...\n");
-		err = k_sem_take(&sem_unprov_beacon, K_SECONDS(10));
+		err = k_sem_take(&sem_unprov_beacon, K_SECONDS(5));
 		if (err == -EAGAIN) {
 			continue;
 		}
