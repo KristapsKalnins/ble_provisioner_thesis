@@ -7,6 +7,7 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(mesh_provisioner_test)
 
 target_sources(app PRIVATE src/main.c
+                           src/rpr_test_client.c
                            src/lib/model/prov_helper_cli.c
                            src/lib/model/prov_helper_srv.c)
 
