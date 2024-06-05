@@ -18,6 +18,9 @@
 #define SW2_NODE	DT_ALIAS(sw2)
 #define SW3_NODE	DT_ALIAS(sw3)
 
+#define INITIALLY_PROVISSIONED_DEVICE_COUNT 3
+#define TOTAL_PROVISIONED_DEVICE_COUNT	5
+
 static const uint16_t net_idx = 0;
 static const uint16_t app_idx = 0;
 static uint16_t self_addr = 1, node_addr;
@@ -28,8 +31,8 @@ static uint8_t app_key[16];
 static uint16_t current_node_address;
 static uint16_t provisioning_address_range_start = 0x0002;
 static uint16_t provisioning_address_range_end = 0x400;
-static int64_t end_time = 0;
-static int64_t start_time = 0;
+int64_t end_time = 0;
+int64_t start_time = 0;
 extern struct bt_mesh_rpr_cli rpr_cli;
 
 #define LOG_LEVEL 4
@@ -108,7 +111,7 @@ void save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh
 	
 	provisioned_count++;
 
-	if(provisioned_count >= 5){
+	if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
 		end_time = k_uptime_get();
 		LOG_INF("Provisioning took %lld seconds", (end_time - start_time)/1000);
 	}
@@ -726,6 +729,13 @@ static int bt_ready(void)
 	return 0;
 }
 
+typedef enum{
+	PROV_DISTRIBUTED,
+	PROV_RPR,
+} prov_mode;
+
+prov_mode mode = PROV_DISTRIBUTED;
+
 static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 {
 	if (!atomic_test_bit(node->flags, BT_MESH_CDB_NODE_CONFIGURED)) {
@@ -746,8 +756,15 @@ static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 
 			provisioned_count++;
 
-			if(provisioned_count >= 3){
-				send_provisioning_data_to_outer_nodes();
+			if(provisioned_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
+				switch(mode){
+					case PROV_DISTRIBUTED:
+						send_provisioning_data_to_outer_nodes();
+						break;
+					case PROV_RPR:
+						start_rpr();
+						break;
+				}
 			}
 		}
 	}
@@ -876,6 +893,7 @@ static void button_init(void)
 }
 #endif
 
+
 int main(void)
 {
 	char uuid_hex_str[32 + 1];
@@ -898,13 +916,38 @@ int main(void)
 #if DT_NODE_HAS_STATUS(SW0_NODE, okay)
 	button_init();
 #endif
+	
+
+	while(1){
+		k_sem_reset(&sem_button_pressed);
+		printk("Press button 1 for distributed provisioning\n");
+		err = k_sem_take(&sem_button_pressed, K_SECONDS(5));
+		if (err == -EAGAIN) {
+			printk("Timed out, button 1 wasn't pressed in time.\n");
+		}else if (err == 0){
+			mode = PROV_DISTRIBUTED;
+			break;
+		}
+		k_sem_reset(&sem_button_two_pressed);
+		printk("Press button 2 for rpr\n");
+		err = k_sem_take(&sem_button_two_pressed, K_SECONDS(5));
+		if (err == -EAGAIN) {
+			printk("Timed out, button 2 wasn't pressed in time.\n");
+			continue;
+		}else if (err == 0){
+			mode = PROV_RPR;
+			break;
+		}
+		
+	}
+
 
 	start_time = k_uptime_get();
 	while (1) {
 		k_sem_reset(&sem_unprov_beacon);
 		k_sem_reset(&sem_node_added);
 		bt_mesh_cdb_node_foreach(check_unconfigured, NULL);
-		if(provisioned_count >= 3){
+		if(provisioned_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
 			k_sleep(K_FOREVER);
 		}
 /*

@@ -6,7 +6,9 @@
 #define LOG_LEVEL 4
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(rpr_test_client);
-
+extern int64_t end_time;
+extern int64_t start_time;
+extern int provisioned_count;
 extern void configure_node(struct bt_mesh_cdb_node *node);
 extern void configure_self(struct bt_mesh_cdb_node *node);
 
@@ -143,11 +145,15 @@ static uint8_t rpr_check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 			configure_self(node);
 		} else {
 			configure_node(node);
+			if(atomic_test_bit(node->flags, BT_MESH_CDB_NODE_CONFIGURED)){
+				provisioned_count++;
+			}
 		}
 	}
 
 	return BT_MESH_CDB_ITER_CONTINUE;
 }
+#define TOTAL_PROVISIONED_DEVICE_COUNT	5
 
 void start_rpr(){
 
@@ -182,6 +188,11 @@ void start_rpr(){
 		    }
 		    bt_mesh_cdb_node_foreach(rpr_check_unconfigured, NULL);
             k_sleep(K_SECONDS(1));
+			if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
+				end_time = k_uptime_get();
+				LOG_INF("Provisioning took %lld seconds", (end_time - start_time)/1000);
+				break;
+			}
 	    }
 
     }
