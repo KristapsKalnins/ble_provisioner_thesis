@@ -19,7 +19,7 @@
 #define SW3_NODE	DT_ALIAS(sw3)
 
 #define INITIALLY_PROVISSIONED_DEVICE_COUNT 3
-#define TOTAL_PROVISIONED_DEVICE_COUNT	5
+#define TOTAL_PROVISIONED_DEVICE_COUNT	16
 
 static const uint16_t net_idx = 0;
 static const uint16_t app_idx = 0;
@@ -324,6 +324,9 @@ void configure_node(struct bt_mesh_cdb_node *node)
 			if (err || status) {
 				printk("Failed (err: %d, status: %d)\n", err,
 				       status);
+					   if(err != 0){
+						return;
+					   }
 			}
 
 
@@ -744,6 +747,11 @@ static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 		} else {
 			configure_node(node);
 
+			if(!atomic_test_bit(node->flags, BT_MESH_CDB_NODE_CONFIGURED)){
+				goto node_not_configured;
+			}
+
+
 			while(bt_mesh_prov_helper_cli_send_appkey(&elements[0].vnd_models[0], app_key, node->addr) == -EBUSY){k_sleep(K_MSEC(100));};
 		
 			while(bt_mesh_prov_helper_cli_send_netkey(&elements[0].vnd_models[0], net_key, node->addr) == -EBUSY){k_sleep(K_MSEC(100));};
@@ -766,6 +774,7 @@ static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 						break;
 				}
 			}
+node_not_configured:
 		}
 	}
 

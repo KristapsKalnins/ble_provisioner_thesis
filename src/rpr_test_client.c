@@ -12,6 +12,10 @@ extern int provisioned_count;
 extern void configure_node(struct bt_mesh_cdb_node *node);
 extern void configure_self(struct bt_mesh_cdb_node *node);
 
+K_SEM_DEFINE(sem_provisioning_complete, 1, 1);
+
+extern struct k_sem sem_node_added;
+
 uint16_t self_addr = 1;
 
 struct remote_prov_data{
@@ -128,7 +132,12 @@ int rpr_provision(uint8_t* uuid, uint16_t node_addr){
 		.net_idx = 0,
 		.ttl = BT_MESH_TTL_DEFAULT,
 	};
+	
+	char uuid_hex_str[32 + 1];
+	bin2hex(uuid, 16, uuid_hex_str, sizeof(uuid_hex_str));
 
+
+	LOG_INF("Provisioning %s", uuid_hex_str);
 	err = bt_mesh_provision_remote(&rpr_cli,
 				       &srv, uuid, 0, 0);
 	if (err) {
@@ -146,6 +155,7 @@ static uint8_t rpr_check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 		} else {
 			configure_node(node);
 			if(atomic_test_bit(node->flags, BT_MESH_CDB_NODE_CONFIGURED)){
+				k_sem_give(&sem_provisioning_complete);
 				provisioned_count++;
 			}
 		}
@@ -153,7 +163,7 @@ static uint8_t rpr_check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 
 	return BT_MESH_CDB_ITER_CONTINUE;
 }
-#define TOTAL_PROVISIONED_DEVICE_COUNT	5
+#define TOTAL_PROVISIONED_DEVICE_COUNT	16
 
 void start_rpr(){
 
@@ -175,9 +185,18 @@ void start_rpr(){
 
 	    int64_t start_time = k_uptime_get();
     	while(((k_uptime_get() - start_time)/1000) < 60){
-	    	// Do this for a total of 60 seconds - keep retrieving the uuids 
+			k_sem_reset(&sem_node_added);
+	    	bt_mesh_cdb_node_foreach(rpr_check_unconfigured, NULL);
+			if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
+				end_time = k_uptime_get();
+				LOG_INF("Provisioning took %lld seconds", (end_time - start_time)/1000);
+				break;
+			}
+			// Do this for a total of 60 seconds - keep retrieving the uuids 
 		    if ((rc = k_msgq_peek(&rpr_scan_results, &found_node)) == 0){
+
 			    rc = rpr_provision(found_node.uuid, found_node.server);
+				k_sem_take(&sem_node_added, K_SECONDS(10));
                 if(rc == 0){
                     // Clear message from queue if provisioning started successfully
                     LOG_INF("Clear message");
@@ -186,13 +205,8 @@ void start_rpr(){
 		    }else{
 		    	printk("... %d\n", rc);
 		    }
-		    bt_mesh_cdb_node_foreach(rpr_check_unconfigured, NULL);
             k_sleep(K_SECONDS(1));
-			if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
-				end_time = k_uptime_get();
-				LOG_INF("Provisioning took %lld seconds", (end_time - start_time)/1000);
-				break;
-			}
+			
 	    }
 
     }
