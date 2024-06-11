@@ -11,6 +11,7 @@ extern int64_t start_time;
 extern int provisioned_count;
 extern void configure_node(struct bt_mesh_cdb_node *node);
 extern void configure_self(struct bt_mesh_cdb_node *node);
+extern void set_publications(uint16_t starting_address);
 
 K_SEM_DEFINE(sem_provisioning_complete, 1, 1);
 
@@ -111,8 +112,7 @@ static int rpr_scan(uint16_t dest_node, uint8_t timeout)
 				     &srv, NULL, timeout,
 				     BT_MESH_RPR_SCAN_MAX_DEVS_ANY, &rsp);
 	if (err) {
-		printk("Scan start failed: %d", err);
-		return err;
+		printk("Scan start failed: %d\n", err);
 	}
 
 	if (rsp.status == BT_MESH_RPR_SUCCESS) {
@@ -121,7 +121,7 @@ static int rpr_scan(uint16_t dest_node, uint8_t timeout)
 		printk("Scan start response: %d\n", rsp.status);
 	}
 
-	return 0;
+	return err;
 }
 
 int rpr_provision(uint8_t* uuid, uint16_t node_addr){
@@ -163,11 +163,11 @@ static uint8_t rpr_check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 
 	return BT_MESH_CDB_ITER_CONTINUE;
 }
-#define TOTAL_PROVISIONED_DEVICE_COUNT	16
+#define TOTAL_PROVISIONED_DEVICE_COUNT	5
 
 void start_rpr(){
 
-	uint16_t list_of_nodes[10];
+	uint16_t list_of_nodes[25];
 
 	int num_nodes = get_list_of_node_addresses(list_of_nodes);
 
@@ -183,8 +183,8 @@ void start_rpr(){
 	
 	    int rc = 0;
 
-	    int64_t start_time = k_uptime_get();
-    	while(((k_uptime_get() - start_time)/1000) < 60){
+	    int64_t rpr_start_time = k_uptime_get();
+    	while(((k_uptime_get() - rpr_start_time)/1000) < 60){
 			k_sem_reset(&sem_node_added);
 	    	bt_mesh_cdb_node_foreach(rpr_check_unconfigured, NULL);
 			if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
@@ -208,6 +208,10 @@ void start_rpr(){
             k_sleep(K_SECONDS(1));
 			
 	    }
+		if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
+				set_publications(0x0002);
+				break;
+		}
 
     }
 }

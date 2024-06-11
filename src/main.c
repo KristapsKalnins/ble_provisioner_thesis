@@ -19,7 +19,7 @@
 #define SW3_NODE	DT_ALIAS(sw3)
 
 #define INITIALLY_PROVISSIONED_DEVICE_COUNT 3
-#define TOTAL_PROVISIONED_DEVICE_COUNT	16
+#define TOTAL_PROVISIONED_DEVICE_COUNT	5
 
 static const uint16_t net_idx = 0;
 static const uint16_t app_idx = 0;
@@ -39,6 +39,7 @@ extern struct bt_mesh_rpr_cli rpr_cli;
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(main);
 
+K_SEM_DEFINE(sem_provisioning_finished, 0 ,1);
 
 K_SEM_DEFINE(sem_unprov_beacon, 0, 1);
 K_SEM_DEFINE(sem_node_added, 0, 1);
@@ -114,6 +115,7 @@ void save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh
 	if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
 		end_time = k_uptime_get();
 		LOG_INF("Provisioning took %lld seconds", (end_time - start_time)/1000);
+		k_sem_give(&sem_provisioning_finished);
 	}
 
 	return;
@@ -522,13 +524,18 @@ void set_publications(uint16_t starting_address){
 			continue;
 		}
 		current_node = found_node->addr;
-		printk("Found node with id 0x%03x\n", found_node->addr);
+		printk("Found node with id 0x%04x\n", found_node->addr);
 
+retry_get_composition:
 		// Get the composition of the publisher(sender)
 		err = bt_mesh_cfg_cli_comp_data_get(net_idx, found_node->addr, 0, &status, &buf);
 		if (err || status) {
 			printk("Failed to get Composition data (err %d, status: %d)\n",
 		    	   err, status);
+			if(err == -116){
+				k_sleep(K_SECONDS(1));
+				goto retry_get_composition;
+			}
 			//return;
 		}
 	
@@ -623,6 +630,38 @@ void set_publications(uint16_t starting_address){
 	int light_count = 0;
 	int switch_count = 0;
 
+	while (switch_count < switch_counter){
+		uint16_t switch_node_addr =  (uint16_t)((switches[switch_count] & 0xFFFF0000) >> 16);
+		uint16_t switch_element_addr = (uint16_t)(switches[switch_count] & 0x0000FFFF);	
+		if(switch_node_addr != switch_element_addr){
+			pub_cfg.addr = 0xC000;
+			printk("Setting publication 0x%03x:%04x -> %04x\n", switch_node_addr, switch_element_addr, pub_cfg.addr);
+			err = bt_mesh_cfg_cli_mod_pub_set(net_idx, switch_node_addr, switch_element_addr, BT_MESH_MODEL_ID_GEN_ONOFF_CLI, &pub_cfg, &status);
+		}else{
+			pub_cfg.addr = 0xD000;
+			printk("Setting publication 0x%03x:%04x -> %04x\n", switch_node_addr, switch_element_addr, pub_cfg.addr);
+			err = bt_mesh_cfg_cli_mod_pub_set(net_idx, switch_node_addr, switch_element_addr, BT_MESH_MODEL_ID_GEN_ONOFF_CLI, &pub_cfg, &status);
+		}
+		switch_count++;
+	}
+
+	while (light_count < light_counter){
+		uint16_t light_node_addr =  (uint16_t)((lights[light_count] & 0xFFFF0000) >> 16);
+		uint16_t light_element_addr = (uint16_t)(lights[light_count] & 0x0000FFFF);
+		if(light_node_addr == light_element_addr){
+			printk("Setting subscription 0x%04x:%04x -> %04x\n", light_node_addr, light_element_addr, 0xD000);
+			err = bt_mesh_cfg_cli_mod_sub_add(net_idx, light_node_addr, light_element_addr, 0xD000, BT_MESH_MODEL_ID_GEN_ONOFF_SRV, &status);
+		}
+		if((light_node_addr + 2) != (light_element_addr) && (light_node_addr != light_element_addr)){
+			printk("Setting subscription 0x%04x:%04x -> %04x\n", light_node_addr, light_element_addr, 0xc000);
+			err = bt_mesh_cfg_cli_mod_sub_add(net_idx, light_node_addr, light_element_addr, 0xc000, BT_MESH_MODEL_ID_GEN_ONOFF_SRV, &status);
+		}
+		light_count++;
+	}
+
+
+
+/*
 	while (switch_count < max_elements && light_count < max_elements) {
 
 			if(switches[switch_count] == 0){
@@ -645,7 +684,7 @@ void set_publications(uint16_t starting_address){
 			light_count++;
 
 	}
-
+*/
 
 	printk("Publication configuration set\n");
 skip_pub_set:
@@ -751,10 +790,11 @@ static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 				goto node_not_configured;
 			}
 
-
-			while(bt_mesh_prov_helper_cli_send_appkey(&elements[0].vnd_models[0], app_key, node->addr) == -EBUSY){k_sleep(K_MSEC(100));};
+			if(mode == PROV_DISTRIBUTED){
+				while(bt_mesh_prov_helper_cli_send_appkey(&elements[0].vnd_models[0], app_key, node->addr) == -EBUSY){k_sleep(K_MSEC(100));};
 		
-			while(bt_mesh_prov_helper_cli_send_netkey(&elements[0].vnd_models[0], net_key, node->addr) == -EBUSY){k_sleep(K_MSEC(100));};
+				while(bt_mesh_prov_helper_cli_send_netkey(&elements[0].vnd_models[0], net_key, node->addr) == -EBUSY){k_sleep(K_MSEC(100));};
+			}
 
 			struct bt_mesh_cdb_node* newnode = bt_mesh_cdb_node_get(node_addr);
 
@@ -957,6 +997,8 @@ int main(void)
 		k_sem_reset(&sem_node_added);
 		bt_mesh_cdb_node_foreach(check_unconfigured, NULL);
 		if(provisioned_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
+			k_sem_take(&sem_provisioning_finished,K_FOREVER);
+			set_publications(0x0002);
 			k_sleep(K_FOREVER);
 		}
 /*
