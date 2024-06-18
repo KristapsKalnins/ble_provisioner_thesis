@@ -18,22 +18,37 @@
 #define SW2_NODE	DT_ALIAS(sw2)
 #define SW3_NODE	DT_ALIAS(sw3)
 
+// Amount of devices provissioned by this provissioner
 #define INITIALLY_PROVISSIONED_DEVICE_COUNT 3
-#define TOTAL_PROVISIONED_DEVICE_COUNT	5
+// Total number of devices provissioned
+#define TOTAL_PROVISIONED_DEVICE_COUNT	20
+// Amount of device provissioned by the other provisioners
+#define DISTRIBUTED_PROVISSIONED_DEVICE_COUNT 3
+// Time to search for devices if DISTRIBUTED_PROVISSIONED_DEVICE_COUNT is not
+// reached by the provisioner
+#define TIME_TO_PROVISION_FOR_SECONDS 60
 
 static const uint16_t net_idx = 0;
 static const uint16_t app_idx = 0;
 static uint16_t self_addr = 1, node_addr;
 static const uint8_t dev_uuid[16] = { 0xdd, 0xdd };
 static uint8_t node_uuid[16];
-static uint8_t net_key[16];
-static uint8_t app_key[16];
+static uint8_t net_key[16] = {0x58, 0xef, 0xd8, 0x0a, 0x94, 0x75, 0xd9, 0xf9, 0x94, 0x52, 0xda, 0x92, 0xe6, 0x83, 0x43, 0x19};
+static uint8_t app_key[16] = {0x44, 0x76, 0xb8, 0xd0, 0xc6, 0xe3, 0x5c, 0xe4, 0x1f, 0xe7, 0x2d, 0xed, 0x8c, 0x87, 0xcb, 0xb6};
 static uint16_t current_node_address;
 static uint16_t provisioning_address_range_start = 0x0002;
 static uint16_t provisioning_address_range_end = 0x400;
 int64_t end_time = 0;
 int64_t start_time = 0;
 extern struct bt_mesh_rpr_cli rpr_cli;
+
+typedef enum{
+	PROV_DISTRIBUTED,
+	PROV_RPR,
+} prov_mode;
+
+prov_mode mode = PROV_DISTRIBUTED;
+
 
 #define LOG_LEVEL 4
 #include <zephyr/logging/log.h>
@@ -86,12 +101,11 @@ static struct bt_mesh_health_cli health_cli = {
 	.current_status = health_current_status,
 };
 
+int provisioned_and_configured_count = 0;
 int provisioned_count = 0;
 
-
-void save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh_msg_ctx *ctx,
+int save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh_msg_ctx *ctx,
 		struct net_buf_simple *buf){
-	
 		
 	char* uuid_p = net_buf_simple_pull_mem(buf, 16);
     uint16_t addr = net_buf_simple_pull_le16(buf);
@@ -108,17 +122,20 @@ void save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh
 
 	printk("Flags received %d for node 0x%04X\n", *((uint32_t*)flags), addr);
 
-	bt_mesh_cdb_node_key_import(new_node, dev_key_p);
-	
-	provisioned_count++;
+	int ret = bt_mesh_cdb_node_key_import(new_node, dev_key_p);
+	if(ret != 0){
+		return ret;
+	}
 
-	if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
+	provisioned_and_configured_count++;
+
+	if(provisioned_and_configured_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
 		end_time = k_uptime_get();
 		LOG_INF("Provisioning took %lld seconds", (end_time - start_time)/1000);
 		k_sem_give(&sem_provisioning_finished);
 	}
 
-	return;
+	return 0;
 }
 
 int get_list_of_node_addresses(uint16_t nodes[]){
@@ -141,7 +158,7 @@ int get_list_of_node_addresses(uint16_t nodes[]){
 }
 
 
-const struct bt_mesh_time_srv_handlers srv_helper_handlers = {
+const struct bt_mesh_prov_helper_srv_handlers srv_helper_handlers = {
 	.prov_helper_message_appkey = NULL,
 	.prov_helper_message_netkey = NULL,
 	.prov_helper_message_nodeinfo = save_remote_node_in_cdb,
@@ -181,7 +198,9 @@ static void setup_cdb(void)
 		return;
 	}
 
-	bt_rand(app_key, 16);
+	//bt_rand(app_key, 16);
+
+	LOG_HEXDUMP_INF(app_key, 16, "app_key");
 
 	err = bt_mesh_cdb_app_key_import(key, 0, app_key);
 	if (err) {
@@ -310,14 +329,11 @@ void configure_node(struct bt_mesh_cdb_node *node)
 		for (int i = 0; i < elem.nsig; i++) {
 			uint16_t id = bt_mesh_comp_p0_elem_mod(&elem, i);
 			// Bind the AppKey only to the generic OnOff Server and Client
-			//if ((id == BT_MESH_MODEL_ID_CFG_CLI ||
-			//    id == BT_MESH_MODEL_ID_CFG_SRV || 
-			//	(id != BT_MESH_MODEL_ID_GEN_ONOFF_SRV &&
-			//	id != BT_MESH_MODEL_ID_GEN_ONOFF_CLI) ||
-			//	(id != BT_MESH_MODEL_ID_BLOB_CLI &&
-			//	id != BT_MESH_MODEL_ID_BLOB_SRV))) {
-			//	continue;
-			//}
+			if ((id == BT_MESH_MODEL_ID_CFG_CLI ||
+			    id == BT_MESH_MODEL_ID_CFG_SRV || 
+				id == BT_MESH_MODEL_ID_REMOTE_PROV_SRV)) {
+				continue;
+			}
 			printk("Binding AppKey to model 0x%03x:%04x\n",
 			       elem_addr, id);
 
@@ -346,6 +362,9 @@ void configure_node(struct bt_mesh_cdb_node *node)
 			if (err || status) {
 				printk("Failed (err: %d, status: %d)\n", err,
 				       status);
+				if(err != 0){
+						return;
+					   }
 			}
 		}
 
@@ -477,7 +496,10 @@ int send_provisioning_data_to_outer_nodes(){
 																		  self_addr,
 																		  nodes[i]);
 		
-		bt_mesh_prov_helper_cli_send_addrinfo(&elements[0].vnd_models[0], start_addr,end_addr, self_addr, nodes[i]);
+		bt_mesh_prov_helper_cli_send_addrinfo(&elements[0].vnd_models[0], 
+											  start_addr,end_addr, self_addr,
+											  nodes[i], DISTRIBUTED_PROVISSIONED_DEVICE_COUNT,
+											  TIME_TO_PROVISION_FOR_SECONDS);
 	
 		if(remaining_address_count <= 0){
 			break;
@@ -488,7 +510,7 @@ int send_provisioning_data_to_outer_nodes(){
 
 // Start from 0x0002 to exclude the initial provisioner
 void set_publications(uint16_t starting_address){
-	NET_BUF_SIMPLE_DEFINE(buf, BT_MESH_RX_SDU_MAX);
+	NET_BUF_SIMPLE_DEFINE(buf, 1024);
 	struct bt_mesh_comp_p0_elem elem;
 	//struct bt_mesh_cdb_app_key *key;
 	//uint8_t app_key[16];
@@ -497,9 +519,9 @@ void set_publications(uint16_t starting_address){
 	int err, elem_addr;
 	struct bt_mesh_cfg_cli_mod_pub pub_cfg, pub_prov;
 
-	uint32_t switches[16] = {0};
+	uint32_t switches[20] = {0};
 	uint16_t switch_counter = 0;
-	uint32_t lights[16] = {0};
+	uint32_t lights[20] = {0};
 	uint16_t light_counter = 0;
 /*
 	key = bt_mesh_cdb_app_key_get(app_idx);
@@ -524,6 +546,7 @@ void set_publications(uint16_t starting_address){
 			continue;
 		}
 		current_node = found_node->addr;
+		printk("comp len %d, comp size %d\n", buf.len, buf.size);
 		printk("Found node with id 0x%04x\n", found_node->addr);
 
 retry_get_composition:
@@ -538,11 +561,11 @@ retry_get_composition:
 			}
 			//return;
 		}
-	
+
 		err = bt_mesh_comp_p0_get(&comp, &buf);
 		if (err) {
-			printk("Unable to parse composition data (err: %d)\n", err);
-			return;
+			printk("Unable to parse composition data (err: %d)\n", err);	
+			goto retry_get_composition;
 		}
 
 		elem_addr = found_node->addr;
@@ -701,10 +724,18 @@ static void unprovisioned_beacon(uint8_t uuid[16],
 	k_sem_give(&sem_unprov_beacon);
 }
 
+extern struct k_msgq rpr_scan_results;
+
 static void node_added(uint16_t idx, uint8_t uuid[16], uint16_t addr, uint8_t num_elem)
 {
 	node_addr = addr;
 	k_sem_give(&sem_node_added);
+	provisioned_count++;
+	if(mode == PROV_RPR){
+		struct remote_prov_data found_node;
+		LOG_INF("Clear message");
+        k_msgq_get(&rpr_scan_results, &found_node, K_NO_WAIT);
+	}
 }
 
 static const struct bt_mesh_prov prov = {
@@ -740,10 +771,12 @@ static int bt_ready(void)
 		settings_load();
 	}
 
-	bt_rand(net_key, 16);
+	//bt_rand(net_key, 16);
 
 	// This part can be skipped on the outer provisioners
 	
+	LOG_HEXDUMP_INF(net_key, 16, "net_key");
+
 	err = bt_mesh_cdb_create(net_key);
 	if (err == -EALREADY) {
 		printk("Using stored CDB\n");
@@ -771,12 +804,6 @@ static int bt_ready(void)
 	return 0;
 }
 
-typedef enum{
-	PROV_DISTRIBUTED,
-	PROV_RPR,
-} prov_mode;
-
-prov_mode mode = PROV_DISTRIBUTED;
 
 static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 {
@@ -802,9 +829,9 @@ static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 			current_node_address += newnode->num_elem;
 
 
-			provisioned_count++;
+			provisioned_and_configured_count++;
 
-			if(provisioned_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
+			if(provisioned_and_configured_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
 				switch(mode){
 					case PROV_DISTRIBUTED:
 						send_provisioning_data_to_outer_nodes();
@@ -996,11 +1023,17 @@ int main(void)
 		k_sem_reset(&sem_unprov_beacon);
 		k_sem_reset(&sem_node_added);
 		bt_mesh_cdb_node_foreach(check_unconfigured, NULL);
-		if(provisioned_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
+
+		if(provisioned_and_configured_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
 			k_sem_take(&sem_provisioning_finished,K_FOREVER);
 			set_publications(0x0002);
 			k_sleep(K_FOREVER);
 		}
+
+		if(provisioned_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
+			continue;
+		}
+
 /*
 #if DT_NODE_HAS_STATUS(SW1_NODE, okay)
 		k_sem_reset(&sem_button_two_pressed);
