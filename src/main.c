@@ -26,7 +26,7 @@
 #define DISTRIBUTED_PROVISSIONED_DEVICE_COUNT 3
 // Time to search for devices if DISTRIBUTED_PROVISSIONED_DEVICE_COUNT is not
 // reached by the provisioner
-#define TIME_TO_PROVISION_FOR_SECONDS 60
+#define TIME_TO_PROVISION_FOR_SECONDS 30
 
 static const uint16_t net_idx = 0;
 static const uint16_t app_idx = 0;
@@ -40,6 +40,10 @@ static uint16_t provisioning_address_range_start = 0x0002;
 static uint16_t provisioning_address_range_end = 0x400;
 int64_t end_time = 0;
 int64_t start_time = 0;
+int64_t first_stage_end = 0;
+static const uint8_t outer1_uuid[16] = { 0xee, 0xdd, 0xab, 0xac, 0xca, 0xde, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+static const uint8_t outer2_uuid[16] = { 0x36, 0xe8, 0xa6, 0x71, 0xb3, 0x4f, 0x4d, 0x0f, 0x89, 0x17, 0x59, 0x8e, 0x4c, 0xb0, 0x52, 0xf0};
+static const uint8_t outer3_uuid[16] = { 0x8e, 0x63, 0xb1, 0xe5, 0x6b, 0x27, 0x40, 0x76, 0xb1, 0x9c, 0x4e, 0x1a, 0x94, 0xd8, 0x9f, 0x89 };
 extern struct bt_mesh_rpr_cli rpr_cli;
 
 typedef enum{
@@ -120,7 +124,7 @@ int save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh_
 
 	memcpy(new_node->flags, flags, sizeof(new_node->flags));
 
-	printk("Flags received %d for node 0x%04X\n", *((uint32_t*)flags), addr);
+	LOG_INF("%d Flags received %d for node 0x%04X", provisioned_and_configured_count, *((uint32_t*)flags), addr);
 
 	int ret = bt_mesh_cdb_node_key_import(new_node, dev_key_p);
 	if(ret != 0){
@@ -131,6 +135,7 @@ int save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh_
 
 	if(provisioned_and_configured_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
 		end_time = k_uptime_get();
+		LOG_INF("Second phase took %lld seconds", (end_time - first_stage_end)/1000);
 		LOG_INF("Provisioning took %lld seconds", (end_time - start_time)/1000);
 		k_sem_give(&sem_provisioning_finished);
 	}
@@ -457,6 +462,8 @@ int send_provisioning_data_to_outer_nodes(){
 	//uint8_t app_key[16];
 
 	LOG_INF("Sending info to outer nodes");
+	first_stage_end = k_uptime_get();
+	LOG_INF("First phase took %lld seconds", (first_stage_end - start_time)/1000);
 
 	uint16_t nodes[32];
 	//struct bt_mesh_comp_p0 comp;
@@ -549,7 +556,11 @@ void set_publications(uint16_t starting_address){
 		printk("comp len %d, comp size %d\n", buf.len, buf.size);
 		printk("Found node with id 0x%04x\n", found_node->addr);
 
+int retry_count = 0;
 retry_get_composition:
+		if(retry_count > 3){
+			continue;
+		}
 		// Get the composition of the publisher(sender)
 		err = bt_mesh_cfg_cli_comp_data_get(net_idx, found_node->addr, 0, &status, &buf);
 		if (err || status) {
@@ -557,6 +568,7 @@ retry_get_composition:
 		    	   err, status);
 			if(err == -116){
 				k_sleep(K_SECONDS(1));
+				retry_count++;
 				goto retry_get_composition;
 			}
 			//return;
@@ -742,10 +754,19 @@ static const struct bt_mesh_prov prov = {
 	.uuid = dev_uuid,
 	.unprovisioned_beacon = unprovisioned_beacon,
 	.node_added = node_added,
-	//.oob_info = BT_MESH_PROV_OOB_CERTIFICATE,
-	//.static_val = "testtesttesttes",
-	//.static_val_len = 15,
+	.oob_info = BT_MESH_PROV_OOB_STRING,
+	.static_val = "NL].KffQkz~DR+$2|^hdYethZ`n{'?vF",
+	.static_val_len = 32,
 };
+
+static void provset_oob_static_val(){
+	int err;
+	if((err = bt_mesh_auth_method_set_static("NL].KffQkz~DR+$2|^hdYethZ`n{'?vF", sizeof("NL].KffQkz~DR+$2|^hdYethZ`n{'?vF") - 1)) == 0){
+		//printk("Static Val set\n");
+	}else{
+		printk("Could not set static val %d\n", err);
+	}
+}
 
 static int bt_ready(void)
 {
@@ -757,13 +778,7 @@ static int bt_ready(void)
 		printk("Initializing mesh failed (err %d)\n", err);
 		return err;
 	}
-/*
-	if((err = bt_mesh_auth_method_set_static("testtesttesttes", sizeof("testtesttesttes"))) == 0){
-		printk("Static Val set\n");
-	}else{
-		printk("Could not set static val %d\n", err);
-	}
-*/
+
 	printk("Mesh initialized\n");
 
 	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
@@ -1022,12 +1037,25 @@ int main(void)
 	while (1) {
 		k_sem_reset(&sem_unprov_beacon);
 		k_sem_reset(&sem_node_added);
+		provset_oob_static_val();
 		bt_mesh_cdb_node_foreach(check_unconfigured, NULL);
 
 		if(provisioned_and_configured_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
-			k_sem_take(&sem_provisioning_finished,K_FOREVER);
-			set_publications(0x0002);
-			k_sleep(K_FOREVER);
+			int res = k_sem_take(&sem_provisioning_finished,K_NO_WAIT);
+			if(res == 0){
+				set_publications(0x0002);
+				k_sleep(K_FOREVER);
+			}else{
+#if DT_NODE_HAS_STATUS(SW3_NODE, okay)
+				k_sem_reset(&sem_button_four_pressed);
+				//printk("Press button 4 to start rpr scan and provision\n");
+				res = k_sem_take(&sem_button_four_pressed, K_SECONDS(5));
+				if (res == 0) {
+					set_publications(0x0002);
+					k_sleep(K_FOREVER);
+				}
+#endif
+			}
 		}
 
 		if(provisioned_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
@@ -1088,8 +1116,13 @@ skip_rpr_start:
 		if (err == -EAGAIN) {
 			continue;
 		}
-
 		bin2hex(node_uuid, 16, uuid_hex_str, sizeof(uuid_hex_str));
+		if((memcmp(node_uuid, outer1_uuid, 16) != 0) &&
+		   (memcmp(node_uuid, outer2_uuid, 16) != 0) &&
+		   (memcmp(node_uuid, outer3_uuid, 16) != 0)){
+			LOG_INF("Node not in initial group %s", uuid_hex_str);
+			continue;
+		}
 /*
 #if DT_NODE_HAS_STATUS(SW0_NODE, okay)
 		k_sem_reset(&sem_button_pressed);

@@ -9,6 +9,7 @@ LOG_MODULE_REGISTER(rpr_test_client);
 extern int64_t end_time;
 extern int64_t start_time;
 extern int provisioned_count;
+extern int provisioned_and_configured_count;
 extern void configure_node(struct bt_mesh_cdb_node *node);
 extern void configure_self(struct bt_mesh_cdb_node *node);
 extern void set_publications(uint16_t starting_address);
@@ -16,6 +17,7 @@ extern void set_publications(uint16_t starting_address);
 K_SEM_DEFINE(sem_provisioning_complete, 1, 1);
 
 extern struct k_sem sem_node_added;
+extern struct k_sem sem_button_four_pressed;
 
 uint16_t self_addr = 1;
 
@@ -26,6 +28,18 @@ uint16_t self_addr = 1;
 struct k_msgq rpr_scan_results;
 
 K_MSGQ_DEFINE(rpr_scan_results, sizeof(struct remote_prov_data), 20, 1);
+
+
+
+static void provset_oob_static_val(){
+	int err;
+	if((err = bt_mesh_auth_method_set_static("NL].KffQkz~DR+$2|^hdYethZ`n{'?vF", sizeof("NL].KffQkz~DR+$2|^hdYethZ`n{'?vF") - 1)) == 0){
+		//printk("Static Val set\n");
+	}else{
+		printk("Could not set static val %d\n", err);
+	}
+}
+
 
 static bool rpr_check_for_duplicates(char* uuid){
 	int peek_count = 0;
@@ -40,16 +54,16 @@ static bool rpr_check_for_duplicates(char* uuid){
 		k_msgq_peek_at(&rpr_scan_results,&found_node, i);
 		bin2hex(uuid, 16, uuid_hex, 33);
 		bin2hex(found_node.uuid, 16, found_node_uuid_hex, 33);
-		LOG_INF("Comparing %s\n%s", found_node_uuid_hex, uuid_hex);
+		//LOG_INF("Comparing %s\n%s", found_node_uuid_hex, uuid_hex);
 		peek_count++;
 		if(memcmp(found_node.uuid, uuid, 16) == 0){
-			LOG_INF("Duplicates!");
+			//LOG_INF("Duplicates!");
 			res = true;
 			break;
 		}
 	}
 
-	LOG_INF("Peeked %d", peek_count);
+	//LOG_INF("Peeked %d", peek_count);
 
 	return res;
 }
@@ -188,8 +202,8 @@ static uint8_t rpr_check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 		} else {
 			configure_node(node);
 			if(atomic_test_bit(node->flags, BT_MESH_CDB_NODE_CONFIGURED)){
+				provisioned_and_configured_count++;
 				k_sem_give(&sem_provisioning_complete);
-				provisioned_count++;
 			}
 		}
 	}
@@ -219,14 +233,26 @@ void start_rpr(){
     	while(((k_uptime_get() - rpr_start_time)/1000) < SCAN_TIME){
 			k_sem_reset(&sem_node_added);
 	    	bt_mesh_cdb_node_foreach(rpr_check_unconfigured, NULL);
-			if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
+#if DT_NODE_HAS_STATUS(SW3_NODE, okay)
+				k_sem_reset(&sem_button_four_pressed);
+				//printk("Press button 4 to start rpr scan and provision\n");
+				res = k_sem_take(&sem_button_four_pressed, K_NO_WAIT);
+				if (res == 0) {
+					set_publications(0x0002);
+					k_sleep(K_FOREVER);
+				}
+#endif
+			if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT && provisioned_and_configured_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
 				end_time = k_uptime_get();
 				LOG_INF("Provisioning took %lld seconds", (end_time - start_time)/1000);
 				break;
+			}else if(provisioned_count >= TOTAL_PROVISIONED_DEVICE_COUNT){
+				LOG_INF("Provisioned enough, configuring");
+				continue;
 			}
 			// Do this for a total of 60 seconds - keep retrieving the uuids 
 		    if ((rc = k_msgq_peek(&rpr_scan_results, &found_node)) == 0){
-
+				provset_oob_static_val();
 			    rc = rpr_provision(found_node.uuid, found_node.server);
 				k_sem_take(&sem_node_added, K_SECONDS(10));
                 if(rc == 0){
