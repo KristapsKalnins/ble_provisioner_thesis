@@ -23,7 +23,7 @@
 // Total number of devices provissioned
 #define TOTAL_PROVISIONED_DEVICE_COUNT	20
 // Amount of device provissioned by the other provisioners
-#define DISTRIBUTED_PROVISSIONED_DEVICE_COUNT 3
+#define DISTRIBUTED_PROVISSIONED_DEVICE_COUNT 4
 // Time to search for devices if DISTRIBUTED_PROVISSIONED_DEVICE_COUNT is not
 // reached by the provisioner
 #define TIME_TO_PROVISION_FOR_SECONDS 30
@@ -117,6 +117,11 @@ int save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh_
     uint8_t num_elem = net_buf_simple_pull_u8(buf);
     char* dev_key_p = net_buf_simple_pull_mem(buf, 16);
 	
+	if(bt_mesh_cdb_node_get(addr) != NULL){
+		LOG_INF("Received Duplicate Node! 0x%04X from 0x%04X", addr, ctx->addr);
+		return;
+	}
+
 	struct bt_mesh_cdb_node* new_node =  bt_mesh_cdb_node_alloc(uuid_p, addr, num_elem, net_idx);
 
 	char* flags;
@@ -124,7 +129,7 @@ int save_remote_node_in_cdb(struct bt_mesh_prov_helper_srv* srv, struct bt_mesh_
 
 	memcpy(new_node->flags, flags, sizeof(new_node->flags));
 
-	LOG_INF("%d Flags received %d for node 0x%04X", provisioned_and_configured_count, *((uint32_t*)flags), addr);
+	LOG_INF("%d Flags received %d for node 0x%04X from 0x%04X", provisioned_and_configured_count, *((uint32_t*)flags), addr, ctx->addr);
 
 	int ret = bt_mesh_cdb_node_key_import(new_node, dev_key_p);
 	if(ret != 0){
@@ -462,8 +467,7 @@ int send_provisioning_data_to_outer_nodes(){
 	//uint8_t app_key[16];
 
 	LOG_INF("Sending info to outer nodes");
-	first_stage_end = k_uptime_get();
-	LOG_INF("First phase took %lld seconds", (first_stage_end - start_time)/1000);
+
 
 	uint16_t nodes[32];
 	//struct bt_mesh_comp_p0 comp;
@@ -499,9 +503,11 @@ int send_provisioning_data_to_outer_nodes(){
 
 		remaining_address_count -= addresses_per_next_provisioner;
 
-		printk("Sending 0x%04X -> 0x%04X with 0x%04X origin to 0x%04X\n", start_addr, end_addr,
+		printk("Sending 0x%04X -> 0x%04X with 0x%04X origin to 0x%04X dist prov: %d dist time %d\n", start_addr, end_addr,
 																		  self_addr,
-																		  nodes[i]);
+																		  nodes[i],
+																		  DISTRIBUTED_PROVISSIONED_DEVICE_COUNT,
+																		  TIME_TO_PROVISION_FOR_SECONDS);
 		
 		bt_mesh_prov_helper_cli_send_addrinfo(&elements[0].vnd_models[0], 
 											  start_addr,end_addr, self_addr,
@@ -639,12 +645,12 @@ retry_get_composition:
 		}
 
 	}
-
+/*
 	for(int i = 0; i < light_counter; i++ ){
 		printk("Lights 0x%08x\n", lights[i]);
 		printk("Switches 0x%08x\n", switches[i]);
 	}
-
+*/
 	if(switch_counter == 0 || light_counter == 0){
 		printk("Skipping %d %d", switch_counter, light_counter);
 		goto skip_pub_set;
@@ -736,17 +742,18 @@ static void unprovisioned_beacon(uint8_t uuid[16],
 	k_sem_give(&sem_unprov_beacon);
 }
 
-extern struct k_msgq rpr_scan_results;
+//extern struct k_msgq rpr_scan_results;
 
 static void node_added(uint16_t idx, uint8_t uuid[16], uint16_t addr, uint8_t num_elem)
 {
 	node_addr = addr;
 	k_sem_give(&sem_node_added);
 	provisioned_count++;
-	if(mode == PROV_RPR){
+	if(mode == PROV_RPR && (provisioned_and_configured_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT)){
 		struct remote_prov_data found_node;
 		LOG_INF("Clear message");
-        k_msgq_get(&rpr_scan_results, &found_node, K_NO_WAIT);
+		rpr_clear_oldest_prov_data(uuid);
+        //k_msgq_get(&rpr_scan_results, &found_node, K_NO_WAIT);
 	}
 }
 
@@ -847,12 +854,14 @@ static uint8_t check_unconfigured(struct bt_mesh_cdb_node *node, void *data)
 			provisioned_and_configured_count++;
 
 			if(provisioned_and_configured_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
+				first_stage_end = k_uptime_get();
+				LOG_INF("First phase took %lld seconds", (first_stage_end - start_time)/1000);
 				switch(mode){
 					case PROV_DISTRIBUTED:
 						send_provisioning_data_to_outer_nodes();
 						break;
 					case PROV_RPR:
-						start_rpr();
+						//start_rpr();
 						break;
 				}
 			}
@@ -1059,7 +1068,13 @@ int main(void)
 		}
 
 		if(provisioned_count >= INITIALLY_PROVISSIONED_DEVICE_COUNT){
-			continue;
+			if(mode == PROV_RPR){
+				first_stage_end = k_uptime_get();
+				LOG_INF("First phase took %lld seconds", (first_stage_end - start_time)/1000);
+				start_rpr();
+			}else{
+			 	continue;
+			}
 		}
 
 /*
